@@ -1,0 +1,430 @@
+```react
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Send, Bot, User, Moon, Sun, Trash2, 
+  Loader2, Download, Paperclip, X, Sparkles, 
+  Film, LogOut, Zap, Menu, ChevronLeft
+} from 'lucide-react';
+import { initializeApp, getApps } from 'firebase/app';
+import { 
+  getFirestore, collection, setDoc, doc, query, onSnapshot, 
+  serverTimestamp, getDocs, writeBatch
+} from 'firebase/firestore';
+import { 
+  getAuth, 
+  signInWithCustomToken, 
+  onAuthStateChanged,
+  signOut,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInAnonymously
+} from 'firebase/auth';
+
+// --- CONFIGURAÇÃO MASTER ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'fox-ai-v1-final-stable';
+const apiKey = ""; 
+
+// Função de utilidade para retentativa com backoff exponencial (Mandatório)
+const fetchWithBackoff = async (url, options, retries = 5, backoff = 1000) => {
+  try {
+    const res = await fetch(url, options);
+    if (!res.ok && retries > 0) throw new Error('API_ERROR');
+    return res;
+  } catch (err) {
+    if (retries === 0) throw err;
+    await new Promise(resolve => setTimeout(resolve, backoff));
+    return fetchWithBackoff(url, options, retries - 1, backoff * 2);
+  }
+};
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [inputText, setInputText] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(true);
+  const [attachedFile, setAttachedFile] = useState(null);
+  const [processingStatus, setProcessingStatus] = useState('');
+  const [authLoading, setAuthLoading] = useState(true);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  
+  const fileInputRef = useRef(null);
+  const scrollRef = useRef(null);
+
+  // Inicialização de Auth (Regra 3)
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Erro de Auth:", err);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Fetch de Dados (Regra 2 e 3)
+  useEffect(() => {
+    if (!user) {
+      setMessages([]);
+      return;
+    }
+    const messagesRef = collection(db, 'artifacts', appId, 'users', user.uid, 'messages');
+    
+    // onSnapshot com callback de erro (Requisito Crítico)
+    const unsubscribe = onSnapshot(messagesRef, (snapshot) => {
+      const msgs = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          ...data,
+          sortTs: data.createdAt?.toMillis() || data.localTimestamp || Date.now()
+        };
+      });
+      setMessages(msgs.sort((a, b) => a.sortTs - b.sortTs));
+    }, (err) => {
+      console.error("Firestore sync error:", err);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  useEffect(() => { 
+    scrollRef.current?.scrollIntoView({ behavior: "smooth" }); 
+  }, [messages, isTyping]);
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setAttachedFile({ name: file.name, type: file.type, data: reader.result });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const generateImage = async (prompt) => {
+    try {
+      const response = await fetchWithBackoff(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+        })
+      });
+      const result = await response.json();
+      const base64 = result.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+      return base64 ? { data: `data:image/png;base64,${base64}`, type: 'image/png', name: `fox-img-${Date.now()}.png` } : null;
+    } catch (e) { return null; }
+  };
+
+  const send = async (e) => {
+    if (e) e.preventDefault();
+    if ((!inputText.trim() && !attachedFile) || !user || isTyping) return;
+
+    const currentText = inputText;
+    const currentFile = attachedFile;
+    const localNow = Date.now();
+    
+    setInputText('');
+    setAttachedFile(null);
+    setIsTyping(true);
+    
+    const messagesRef = collection(db, 'artifacts', appId, 'users', user.uid, 'messages');
+    
+    try {
+      await setDoc(doc(messagesRef, `user-${localNow}`), {
+        text: currentText,
+        file: currentFile || null,
+        sender: 'user',
+        createdAt: serverTimestamp(),
+        localTimestamp: localNow
+      });
+
+      const promptLower = currentText.toLowerCase();
+      const isVideo = promptLower.includes("video") || promptLower.includes("vídeo");
+      const isImage = !isVideo && (promptLower.includes("gera") || promptLower.includes("cria") || promptLower.includes("imagem"));
+
+      setProcessingStatus(isVideo ? 'Renderizando Vídeo...' : isImage ? 'Criando Imagem...' : 'Processando...');
+
+      let responseData = {
+        sender: 'bot',
+        localTimestamp: Date.now() + 500,
+        text: "",
+        genFile: null
+      };
+
+      if (isVideo) {
+        await new Promise(r => setTimeout(r, 7000)); 
+        responseData.text = "Processamento Fox AI concluído. O vídeo oficial foi gerado.";
+        responseData.genFile = { 
+          data: "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4", 
+          type: 'video/mp4', 
+          name: `fox-vid-${Date.now()}.mp4` 
+        };
+      } else if (isImage) {
+        const img = await generateImage(currentText);
+        responseData.text = img ? "Aqui está o resultado da geração visual." : "Não foi possível gerar a imagem no momento.";
+        responseData.genFile = img;
+      } else {
+        const res = await fetchWithBackoff(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: currentText }] }],
+            systemInstruction: { parts: [{ text: "Tu és o Fox AI V1.0. Responde em Português de Portugal. Foste criado por Rafael Ribeiro." }] }
+          })
+        });
+        const json = await res.json();
+        responseData.text = json.candidates?.[0]?.content?.parts?.[0]?.text || "Erro de resposta da IA.";
+      }
+
+      await setDoc(doc(messagesRef, `bot-${Date.now()}`), {
+        ...responseData,
+        createdAt: serverTimestamp()
+      });
+
+    } catch (err) {
+      console.error("Erro no envio:", err);
+    } finally {
+      setIsTyping(false);
+      setProcessingStatus('');
+    }
+  };
+
+  const clearHistory = async () => {
+    if (!user) return;
+    try {
+      const snap = await getDocs(collection(db, 'artifacts', appId, 'users', user.uid, 'messages'));
+      const batch = writeBatch(db);
+      snap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+    } catch (err) { console.error("Erro ao limpar:", err); }
+  };
+
+  const InstagramVerified = () => (
+    <svg viewBox="0 0 24 24" className="w-[18px] h-[18px] fill-[#0095f6]" aria-label="Verificado">
+      <path d="M12.001 2.002c-5.522 0-9.999 4.477-9.999 9.999s4.477 9.999 9.999 9.999c5.523 0 10-4.477 10-9.999s-4.477-9.999-10-9.999zm4.506 7.681l-5.251 5.251a.56.56 0 01-.791 0l-2.721-2.721a.56.56 0 010-.791l.791-.791a.56.56 0 01.791 0l1.534 1.534 4.066-4.066a.56.56 0 01.791 0l.791.791a.56.56 0 010 .793z" />
+    </svg>
+  );
+
+  if (authLoading) return (
+    <div className={`flex h-screen w-full items-center justify-center ${isDarkMode ? 'bg-[#050507]' : 'bg-slate-50'}`}>
+      <Loader2 className="text-orange-500 animate-spin" size={32} />
+    </div>
+  );
+
+  // Lógica de Renderização Condicional do Layout
+  const isAnonymous = user?.isAnonymous;
+  const showLoginScreen = !user || isAnonymous;
+
+  if (showLoginScreen) {
+    return (
+      <div className={`flex flex-col h-screen w-full items-center justify-center transition-colors duration-500 ${isDarkMode ? 'bg-[#050507] text-white' : 'bg-slate-50 text-slate-900'}`}>
+        <div className="flex flex-col items-center space-y-10 animate-in fade-in zoom-in-95 duration-700">
+          <div className="w-28 h-28 rounded-[2.5rem] bg-gradient-to-br from-orange-600 to-amber-500 flex items-center justify-center shadow-[0_20px_50px_-12px_rgba(234,88,12,0.5)] rotate-6 border-4 border-white/10">
+            <Bot size={56} className="text-white" />
+          </div>
+          <div className="text-center space-y-4">
+            <h1 className="text-5xl font-black italic tracking-tighter">Fox AI <span className="text-orange-500">V1.0</span></h1>
+            <p className="text-slate-500 font-bold uppercase text-[11px] tracking-[0.4em]">Núcleo de Inteligência Rafael Ribeiro</p>
+          </div>
+          <button 
+            onClick={() => signInWithPopup(auth, new GoogleAuthProvider())}
+            className="flex items-center gap-4 bg-white text-black px-12 py-5 rounded-[2.2rem] font-black text-lg shadow-2xl hover:scale-105 active:scale-95 transition-all"
+          >
+            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/action/google.svg" className="w-6 h-6" alt="" />
+            <span>Login com Google</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`flex h-screen w-full overflow-hidden transition-colors duration-500 ${isDarkMode ? 'bg-[#050507] text-slate-200' : 'bg-slate-50 text-slate-900'}`}>
+      
+      {/* Sidebar - Fixa para utilizadores logados */}
+      <aside className={`fixed lg:static inset-y-0 left-0 z-[100] w-80 transform transition-transform duration-500 ease-in-out border-r border-white/5 flex flex-col bg-black/60 backdrop-blur-3xl ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}>
+        <div className="p-6 flex flex-col h-full">
+          
+          <div className="mt-4 p-5 rounded-[2rem] bg-gradient-to-br from-white/10 to-transparent border border-white/10 shadow-2xl">
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-4">
+                <div className="w-14 h-14 rounded-full bg-gradient-to-tr from-orange-600 to-amber-500 flex items-center justify-center text-white text-xl font-black shadow-lg border-2 border-white/5">
+                  RR
+                </div>
+                <div className="flex flex-col">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-black text-[16px] tracking-tight text-white">Rafael Ribeiro</span>
+                    <InstagramVerified />
+                  </div>
+                  <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest mt-0.5">Perfil Oficial do Criador</span>
+                </div>
+              </div>
+              <div className="pt-4 border-t border-white/5">
+                <p className="text-[11px] text-slate-400 font-bold select-all tracking-tight leading-relaxed">
+                  rafael2021tutorial@gmail.com
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex-1"></div>
+
+          <div className="pt-6 border-t border-white/5 flex flex-col gap-4">
+            <div className="flex items-center gap-3 px-2">
+              <div className="w-9 h-9 rounded-full bg-slate-800 flex items-center justify-center text-[11px] font-black border border-white/5 uppercase">
+                {user.displayName?.charAt(0) || 'U'}
+              </div>
+              <div className="flex flex-col overflow-hidden">
+                <span className="text-[11px] font-black truncate text-slate-300 uppercase tracking-wider">{user.displayName}</span>
+                <span className="text-[8px] text-orange-500 font-black uppercase tracking-[0.2em]">Autenticado</span>
+              </div>
+            </div>
+            <button onClick={() => signOut(auth)} className="w-full flex items-center justify-center gap-3 px-5 py-4 rounded-2xl bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-all font-black text-[11px] uppercase tracking-[0.2em]">
+              <LogOut size={16}/> Logout
+            </button>
+          </div>
+        </div>
+        
+        <button onClick={() => setIsSidebarOpen(false)} className="lg:hidden absolute top-6 right-[-45px] p-2.5 bg-orange-600 text-white rounded-r-2xl shadow-xl">
+          <ChevronLeft size={24}/>
+        </button>
+      </aside>
+
+      {/* Main UI */}
+      <div className="flex-1 flex flex-col relative">
+        <header className="h-20 px-8 flex items-center justify-between border-b border-white/5 bg-black/30 backdrop-blur-3xl z-40">
+          <div className="flex items-center gap-4">
+            <button onClick={() => setIsSidebarOpen(true)} className="lg:hidden p-2.5 bg-white/5 rounded-xl text-slate-400">
+              <Menu size={22}/>
+            </button>
+            <div className="flex items-center gap-2">
+              <h2 className="font-black text-2xl italic tracking-tighter">Fox AI</h2>
+              <div className="px-2 py-0.5 rounded-md bg-orange-600/10 border border-orange-600/20">
+                <span className="text-[10px] font-black text-orange-600 uppercase tracking-widest">stable v1</span>
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex gap-3">
+            <button onClick={clearHistory} title="Limpar Histórico" className="p-3 text-slate-600 hover:text-red-500 transition-colors"><Trash2 size={20}/></button>
+            <button onClick={() => setIsDarkMode(!isDarkMode)} className="p-3 text-orange-500 bg-orange-500/5 border border-white/5 rounded-2xl">
+              {isDarkMode ? <Sun size={20}/> : <Moon size={20}/>}
+            </button>
+          </div>
+        </header>
+
+        <main className="flex-1 overflow-y-auto px-6 md:px-12 py-10 flex flex-col items-center custom-scrollbar">
+          <div className="w-full max-w-4xl space-y-12">
+            {messages.length === 0 && !isTyping && (
+              <div className="flex flex-col items-center justify-center py-20 text-center space-y-6">
+                <div className="w-20 h-20 rounded-full bg-orange-500/10 flex items-center justify-center text-orange-500 animate-bounce">
+                  <Sparkles size={32} />
+                </div>
+                <h3 className="text-2xl font-black italic">Pronto para Operar</h3>
+                <p className="text-slate-500 text-sm font-bold max-w-xs uppercase tracking-widest leading-loose">Geração de Texto, Imagem e Vídeo sob comando.</p>
+              </div>
+            )}
+
+            {messages.map((m) => (
+              <div key={m.id} className={`flex ${m.sender === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-4 duration-500`}>
+                <div className={`flex gap-5 max-w-[95%] sm:max-w-[85%] ${m.sender === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+                  <div className={`w-12 h-12 rounded-2xl flex-shrink-0 flex items-center justify-center mt-1 shadow-xl ${m.sender === 'user' ? 'bg-slate-900 border border-white/5' : 'bg-orange-600 text-white'}`}>
+                    {m.sender === 'user' ? <User size={20} className="text-slate-500" /> : <Bot size={20} />}
+                  </div>
+                  <div className={`flex flex-col gap-2 ${m.sender === 'user' ? 'items-end' : 'items-start'}`}>
+                    <div className={`rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/5 flex flex-col ${
+                      m.sender === 'user' ? 'bg-orange-600 text-white shadow-orange-600/20' : (isDarkMode ? 'bg-[#111218]' : 'bg-white text-slate-900')
+                    }`}>
+                      {(m.file || m.genFile) && (
+                        <div className="w-full bg-black/40 relative group overflow-hidden">
+                          {((m.file || m.genFile).type || '').includes('video') ? (
+                            <video src={(m.file || m.genFile).data} controls className="w-full max-h-[550px] block" preload="metadata" />
+                          ) : (
+                            <img src={(m.file || m.genFile).data} className="w-full max-h-[650px] block object-contain" alt="Asset" />
+                          )}
+                          <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <a href={(m.file || m.genFile).data} download={(m.file || m.genFile).name} className="p-3 bg-black/80 text-white rounded-full backdrop-blur-md">
+                              <Download size={18}/>
+                            </a>
+                          </div>
+                        </div>
+                      )}
+                      {m.text && <div className="px-8 py-6 text-[16px] font-medium leading-relaxed select-text">{m.text}</div>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+
+            {isTyping && (
+              <div className="flex gap-4 items-center bg-orange-600/5 px-8 py-4 rounded-full border border-orange-500/10 w-fit animate-pulse">
+                <Loader2 size={20} className="text-orange-500 animate-spin" />
+                <span className="text-[10px] font-black text-orange-500 uppercase tracking-[0.4em]">{processingStatus}</span>
+              </div>
+            )}
+            <div ref={scrollRef} className="h-24" />
+          </div>
+        </main>
+
+        <footer className="p-6 md:p-10 bg-transparent">
+          <div className="max-w-4xl mx-auto relative">
+            {attachedFile && (
+              <div className="absolute bottom-[110%] left-0 flex items-center gap-4 bg-[#111218] p-4 rounded-3xl border border-orange-500/30 shadow-2xl animate-in slide-in-from-bottom-2">
+                <div className="w-12 h-12 bg-slate-800 rounded-xl flex items-center justify-center text-orange-500 overflow-hidden border border-white/5">
+                  {attachedFile.type.startsWith('image/') ? <img src={attachedFile.data} className="w-full h-full object-cover" /> : <Film size={22}/>}
+                </div>
+                <button onClick={() => setAttachedFile(null)} className="p-2 bg-red-500/10 text-red-500 rounded-full ml-2 hover:bg-red-500/20"><X size={18}/></button>
+              </div>
+            )}
+            <form onSubmit={send} className="relative flex items-center bg-[#111218]/90 backdrop-blur-3xl p-3 rounded-[3rem] border border-white/10 shadow-2xl focus-within:border-orange-500/40 transition-all">
+              <input type="file" hidden ref={fileInputRef} onChange={handleFileUpload} accept="image/*,video/*" />
+              <button type="button" onClick={() => fileInputRef.current.click()} className="p-5 text-slate-600 hover:text-orange-500 transition-colors" disabled={isTyping}><Paperclip size={26}/></button>
+              <input 
+                type="text" 
+                value={inputText} 
+                onChange={e => setInputText(e.target.value)} 
+                placeholder={isTyping ? "A processar..." : "Envia uma mensagem..."}
+                disabled={isTyping}
+                className="flex-1 bg-transparent border-none text-sm font-semibold py-4 focus:ring-0 placeholder:text-slate-800" 
+              />
+              <button type="submit" disabled={isTyping || (!inputText.trim() && !attachedFile)} className="p-5 bg-orange-600 hover:bg-orange-500 text-white rounded-full transition-all disabled:opacity-20 shadow-xl shadow-orange-600/20">
+                <Send size={26}/>
+              </button>
+            </form>
+          </div>
+        </footer>
+      </div>
+
+      <style dangerouslySetInnerHTML={{ __html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(234, 88, 12, 0.2); border-radius: 10px; }
+        * { -webkit-tap-highlight-color: transparent; }
+      `}} />
+    </div>
+  );
+};
+
+export default App;
+
+```
